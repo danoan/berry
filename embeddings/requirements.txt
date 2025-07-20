@@ -1,0 +1,8 @@
+# server
+fastapi[standard]
+uvicorn
+python-multipart
+
+# embedding
+transformers
+torch

@@ -1,0 +1,7 @@
+.tool-versions
+__pycache__
+venv
+asr-models
+documents
+embeddings
+index
