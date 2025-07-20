@@ -36,36 +36,24 @@ def health():
     return "embedding-server: OK"
 
 @app.post("/process_documents")
-async def process_documents(documents_files:list[UploadFile]):
-    documents_contents = []
-    for f in documents_files:
-        documents_contents.append( (await f.read()).decode("utf-8") )
-
-    processed_documents = [
-            pd.model_dump() for pd in embedding.process_documents(documents_contents)
-    ]
-    logger.info(processed_documents)
-    return JSONResponse(processed_documents)
+async def process_document(document_file:UploadFile):
+    document_contents = (await document_file.read()).decode("utf-8")
+    chunks = embedding.process_documents(document_contents)
+    return JSONResponse(chunks)
 
 @app.post("/create")
-async def create_embedding(chunks_files:list[UploadFile], embedding_name:Annotated[str, Form()]):
-    if len(embedding_name.split(".")) == 1:
-        embedding_name += ".npy"
-    
+async def create_embedding(chunks_files:list[UploadFile]):
     documents_contents = []
     for f in chunks_files:
         documents_contents.append( (await f.read()).decode("utf-8") )
 
-    embedding_full_path = config.embeddings_folder / embedding_name
     embedding_vectors = embedding.create_embedding(documents_contents)
-    embedding.write_embedding(embedding_vectors,embedding_full_path)
-
 
     sstream = StringIO()
     embedding.write_embedding(embedding_vectors,sstream,"text")
     sstream.seek(0)
     embedding_vectors_csv_string = sstream.read()
-    return JSONResponse({"embedding_name":embedding_name,"embedding":embedding_vectors_csv_string})
+    return JSONResponse({"embedding":embedding_vectors_csv_string})
 
 @app.post("/get")
 async def get_embedding(text:Annotated[str,Form()]):

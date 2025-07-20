@@ -1,10 +1,9 @@
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-import datetime
 import io
-import json
 import logging
 import numpy as np
+import os
 from pathlib import Path
 import sys
 from typing import Any, List, Optional
@@ -42,33 +41,77 @@ app = FastAPI(lifespan=lifespan)
 def health():
     pass
 
+class DocumentProperties(BaseModel):
+    index: int
+    name: str
+    total_chunks: int
+
 class IndexProperties(BaseModel):
     index_name: str
-    embeddings: List[str]
+    documents: List[DocumentProperties]
 
-@app.post("/from_embeddings/create")
-async def create_from_embeddings(embedding_files: List[UploadFile]):
-    index_name = datetime.datetime.now().strftime("%Y-%m-%d")
+@app.post("/add")
+async def add_embedding(index_name: Annotated[str,Form()],embedding_file: UploadFile, document_name:Annotated[str,Form()]):
+    index_main_folder = config.index_folder / index_name
+
+    if not index_main_folder.exists():
+        raise HTTPException(status_code=500,detail=f"The index {index_name} does not exist")
+
+    with open(index_main_folder / "index_properties.json") as f:
+        ip = IndexProperties.model_validate_json(f.read())
+
+    if document_name in [d.name for d in ip.documents]:
+        return JSONResponse(ip.model_dump_json())
+
+    content = io.BytesIO(await embedding_file.read())
+    embedding_vectors = rag.load_embedding_from_binary_file(content)
+    shape = rag.add_to_index(index_main_folder / index_name,embedding_vectors)
+
+    logger.info(f"Shape: {shape}")
+    
+    dp = DocumentProperties(
+        index=len(ip.documents),
+        name=document_name,
+        total_chunks=shape[0]
+    )
+    ip.documents.append(dp)
+
+    with open(index_main_folder / "index_properties.json", "w") as f:
+        f.write(ip.model_dump_json(indent=2))
+
+    return JSONResponse(ip.model_dump_json())
+
+@app.post("/create")
+async def create(index_name: Annotated[str,Form()]):
     new_index_folder = config.index_folder / index_name
+    if new_index_folder.exists():
+        return f"Index {index_name} exist already"
+    
     new_index_folder.mkdir(parents=True,exist_ok=True)
-    for embedding in embedding_files:
-        content = io.BytesIO(await embedding.read())
-        rag.write_to_index(new_index_folder / index_name,rag.load_embedding_from_binary_file(content))
-
-    filenames = []
-    for e in embedding_files:
-        if e.filename:
-            filenames.append(Path(e.filename).stem)
 
     ip = IndexProperties(
         index_name=index_name,
-        embeddings=filenames
+        documents=[]
     )
 
     with open(new_index_folder / "index_properties.json", "w") as f:
         f.write(ip.model_dump_json(indent=2))
 
     return JSONResponse({"index_name":index_name})
+
+@app.post("/remove")
+async def remove(index_name: Annotated[str,Form()]):
+    index_folder = config.index_folder / index_name
+
+    if not index_folder.exists():
+        return f"Index {index_name} does not exist"
+
+    for f in index_folder.iterdir():
+        os.remove(f)
+
+    index_folder.rmdir()
+
+    return f"Index {index_name} removed"
 
 @app.get("/list")
 def list_indexes():
@@ -83,13 +126,8 @@ def _to_csv_string(X:np.ndarray) -> str:
 
 
 @app.post("/query")
-async def query(query_string:Annotated[str,Form()], index:Optional[str]=Form(None)):
-    if index is None:
-        index_folder = sorted(list(config.index_folder.iterdir()))[-1]
-        index_name = index_folder.name
-    else:
-        index_folder = config.index_folder / index
-        index_name = index
+async def query(query_string:Annotated[str,Form()], index_name:Annotated[str,Form()]):
+    index_folder = config.index_folder / index_name
 
     with open(index_folder / "index_properties.json") as f:
         ip = IndexProperties.model_validate_json(f.read())
@@ -103,14 +141,15 @@ async def query(query_string:Annotated[str,Form()], index:Optional[str]=Form(Non
             csv_string:str = response.json()
             sstream = io.StringIO(csv_string)
             embedding_vector = rag.load_embedding_from_text_file(sstream)
-            embedding_matrix = embedding_vector.reshape(1,embedding_vector.shape[0])
-            D,I = rag.query_index(index_folder / index_name,embedding_matrix)
+            logger.info(embedding_vector.shape)
+            D,I = rag.query_index(index_folder / index_name,embedding_vector)
 
             query_response:dict[str,Any] = {
-                "embedding_names": ip.embeddings,
+                "index_properties": ip.model_dump(),
                 "distances":_to_csv_string(D),
                 "neighbors":_to_csv_string(I)
             }
+            logger.info(query_response)
             return JSONResponse(query_response)
         else:
             raise HTTPException(status_code=response.status_code, detail=response.content)

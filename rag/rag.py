@@ -10,25 +10,40 @@ import numpy as np
 ###################
 # API
 ###################
-
-def write_to_index(index_path: Path, embedding: np.ndarray):
+def add_to_index(index_path: Path, embedding: np.ndarray):
     """
-    Write embeddings.
+    Add embeddings.
     """
     # embeddings = np.load("../embeddings/embedding.npy")
 
-    index = faiss.IndexFlatIP(768)  # Use IndexFlatL2 if no normalization
+    if index_path.exists():
+        index = faiss.read_index(str(index_path))
+    else:
+        index = faiss.IndexFlatIP(768)  # Use IndexFlatL2 if no normalization
+
+    if embedding.ndim == 1:
+        embedding = embedding.reshape(1,embedding.shape[0])
+
     index.add(embedding.astype(np.float32))  # embeddings must be float32
+    sys.stderr.write(f"Total vectors in index: {index.ntotal}")
 
     # Save to disk
     faiss.write_index(index, str(index_path))
+    return embedding.shape
 
 
 def load_embedding_from_binary_file(from_file: Union[Path,BytesIO]) -> np.ndarray:
-    return np.load(from_file)
+    embedding = np.load(from_file)
+    if embedding.ndim == 1:
+        embedding = embedding.reshape(1,embedding.shape[0])
+    return embedding
 
 def load_embedding_from_text_file(from_file: Union[Path,TextIO]) -> np.ndarray:
-    return np.loadtxt(from_file)
+    embedding = np.loadtxt(from_file)
+    if embedding.ndim == 1:
+        embedding = embedding.reshape(1,embedding.shape[0])
+    return embedding
+
 
 def query_index(index_path: Path, query_embedding: np.ndarray) -> Tuple[np.ndarray,np.ndarray]:
     index = faiss.read_index(str(index_path))
@@ -40,8 +55,8 @@ def query_index(index_path: Path, query_embedding: np.ndarray) -> Tuple[np.ndarr
 ###################
 
 def write_parser(subparser):
-    command_name = "write"
-    description = write_to_index.__doc__
+    command_name = "add-document"
+    description = add_to_index.__doc__
     help = description.split(".")[0] if description else ""
 
     parser : ArgumentParser = subparser.add_parser(command_name,description=description,help=help)
@@ -60,14 +75,14 @@ def write_parser(subparser):
         else:
             raise RuntimeError("Data could not be read")
 
-        return write_to_index(index_path, data)
+        return add_to_index(index_path, data)
 
     parser.set_defaults(func=pre_call,subcommand_help=parser.print_help)
     return parser
 
 def query_parser(subparser):
     command_name = "query"
-    description = write_to_index.__doc__
+    description = query_index.__doc__
     help = description.split(".")[0] if description else ""
 
     parser : ArgumentParser = subparser.add_parser(command_name,description=description,help=help)

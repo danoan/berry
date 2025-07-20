@@ -1,6 +1,8 @@
+import bisect
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import lru_cache
 import io
 import json
 import logging
@@ -9,6 +11,7 @@ import os
 from pathlib import Path
 import queue
 import sys
+import tempfile
 import threading
 import time
 from typing import Annotated, Any, Callable, List, Optional
@@ -21,8 +24,6 @@ from vosk import Model, KaldiRecognizer, SetLogLevel
 from fastapi import FastAPI, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 import httpx
-
-from embeddings import embedding
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -193,14 +194,16 @@ def get_model(language: Language, variation: ASRModelVariation) -> ASRModel:
     model_path = Path(asr_model_repository) / language / variation
     return ASRModel(language=language, variation=variation, path=model_path) 
 
-def create_file_data(file_paths:list[Path], field_name:str):
+def create_file_data(file_path:Path, field_name:str):
+    with open(file_path, "rb") as f:
+        return (field_name, (f.name,f.read(), "application/octet-stream"))
+
+def create_list_file_data(file_paths:list[Path], field_name:str):
     file_data = []
-    for embedding_path in file_paths:
-        with open(embedding_path, "rb") as f:
-            file_data.append(
-                (field_name, (f.name,f.read(), "application/octet-stream"))
-            )
+    for file_path in file_paths:
+        file_data.append(create_file_data(file_path,field_name))
     return file_data
+
 
 ###########################
 # Core
@@ -236,7 +239,6 @@ class Query(BaseModel):
 @dataclass
 class Config:
     documents_folder: Path = Path(__file__).parent / "documents"
-    embeddings_folder: Path = Path(__file__).parent / "embeddings"
     asr_models_folder: Path = Path(__file__).parent / "asr-models" 
     embedding_endpoint: str = "http://localhost:8001"
     index_endpoint: str = "http://localhost:8002"
@@ -251,7 +253,6 @@ class Config:
 async def lifespan(app: FastAPI):
     # select_model(str(Language.BrazilianPortuguese),str(ASRModelVariation.Small))
     config.documents_folder.mkdir(parents=True, exist_ok=True)
-    config.embeddings_folder.mkdir(parents=True, exist_ok=True)
     yield
     # stop()
 
@@ -299,15 +300,64 @@ def stop():
 #--------------------------
 # Documents 
 #--------------------------
+async def _process_document(filepath: Path) -> list[str]:
+    """
+    Process document into ProcessedDocument objects.
+
+    Returns a map indexed by the position of the first chunk of text belonging to 
+    the document.
+    """
+    documents_data = [create_file_data(filepath,"document_file")]
+    process_documents_url = f"{config.embedding_endpoint}/process_documents"
+
+    async with httpx.AsyncClient() as client:
+        response: httpx.Response  = await client.post(process_documents_url, files=documents_data)
+
+        if response.status_code == 200:
+            return response.json()  
+        else:
+            raise HTTPException(status_code=response.status_code, detail=response.content)
+
+
+def _create_chunks(chunk_contents: list[str], chunks_folder: Path) -> None:
+    chunks_folder.mkdir(parents=True,exist_ok=True)
+
+    chunk_number = 0
+    for chunk in chunk_contents:
+        chunk_filename = f"{chunk_number}.txt"
+        chunk_path = chunks_folder / chunk_filename
+        with open(chunk_path,"w") as f:
+            f.write(chunk)
+        chunk_number+=1
+
+
 @app.post("/documents/upload")
 async def upload_document(file: UploadFile):
     if file and file.filename:
-        destination_path = config.documents_folder / file.filename
+        document_filename = file.filename
+        document_name = Path(file.filename).stem
+        document_folder = config.documents_folder / document_name
+        document_folder.mkdir(parents=True,exist_ok=True)
+
+        logger.info("Uploading document")
+        destination_path = document_folder / document_filename
         with open(destination_path, "wb") as f:
             f.write(await file.read())
+
+
+        logger.info("Processing document")
+        try:
+            chunks_contents = await _process_document(destination_path)
+        except HTTPException as ex:
+            return JSONResponse({"origin":"process_document", "status_code": ex.status_code, "detail": ex.detail})
+
+        logger.info(f"Storing chunks")
+        chunks_folder = document_folder / "chunks"
+        _create_chunks(chunks_contents,chunks_folder)
+
         return JSONResponse({"filename": file.filename})
     else:
-        return HTTPException(status_code=500, detail="Error while uploading the file")
+        return JSONResponse({"origin":"documents/upload", "status_code": 500, "detail": "Error while uploading the file"})
 
 
 @app.get("/documents/list")
@@ -321,77 +371,12 @@ def remove_document(filename: Annotated[str, Form()]):
         os.remove(document_full_path)
         return JSONResponse({"filename":filename})
     else:
-        raise HTTPException(status_code=404, detail="File does not exist")
+        return JSONResponse({"origin":"documents/remove", "status_code": 500, "detail": "Document does not exist"})
 
 #--------------------------
-# Embeddings
+# Vector Database 
 #--------------------------
-class ProcessedDocument(BaseModel):
-    filename: str
-    index: int
-    chunks: list[str]
-
-class DocumentChunkIndex(BaseModel):
-    document_filename: str
-    chunk_index_range: tuple[int,int] 
-
-class EmbeddingChunkIndex(BaseModel):
-    indexes: list[DocumentChunkIndex] = []
-
-async def _process_documents(filenames: list[str]) -> list[ProcessedDocument]:
-    """
-    Process documents into ProcessedDocument objects.
-
-    Returns a map indexed by the position of the first chunk of text belonging to 
-    the document.
-    """
-    full_documents_path = [ config.documents_folder / filename for filename in filenames ]
-    
-    documents_data = create_file_data(full_documents_path,"documents_files")
-    process_documents_url = f"{config.embedding_endpoint}/process_documents"
-
-    async with httpx.AsyncClient() as client:
-        response: httpx.Response  = await client.post(process_documents_url, files=documents_data)
-
-        if response.status_code == 200:
-            return [ ProcessedDocument(filename=filenames[i], index=i, chunks=e["chunks"]) for i,e in enumerate(response.json()) ]
-        else:
-            raise HTTPException(status_code=response.status_code, detail=response.content)
-
-
-def _to_embedding_chunk_index(processed_documents: list[ProcessedDocument]) -> EmbeddingChunkIndex:
-    """
-    Map documents to chunk indexes.
-
-    This index is later used to recover the chunks of data to send to a LLM.
-    """
-    eci = EmbeddingChunkIndex()
-    total_chunks = 0
-    for pd in processed_documents:
-        processed_document = ProcessedDocument.model_validate(pd)
-        first_chunk_index = total_chunks
-        last_chunk_index = total_chunks + len(processed_document.chunks) - 1
-        total_chunks += len(processed_document.chunks)
-        eci.indexes.append(DocumentChunkIndex(document_filename=processed_document.filename,
-                                              chunk_index_range=(first_chunk_index,last_chunk_index)))
-    return eci
-
-def _create_chunks(processed_documents: list[ProcessedDocument], chunks_folder: Path) -> None:
-    chunks_folder.mkdir(parents=True,exist_ok=True)
-
-    chunk_number = 0
-    for pd in processed_documents:
-        processed_document = ProcessedDocument.model_validate(pd)
-        logger.info(f"Creating chunk files for {processed_document.filename}")
-        for chunk in processed_document.chunks:
-            chunk_filename = f"{chunk_number}.txt"
-            chunk_path = chunks_folder / chunk_filename
-            with open(chunk_path,"w") as f:
-                f.write(chunk)
-            chunk_number+=1
-
-
-async def _create_embedding(chunks_data, embedding_name: str) -> dict[str,str]:
+async def _create_embedding(chunks_data) -> dict[str,str]:
     """
     Create an embedding for a list of ProcessedDocument.
 
@@ -400,108 +385,79 @@ async def _create_embedding(chunks_data, embedding_name: str) -> dict[str,str]:
     """
 
     create_embedding_url = f"{config.embedding_endpoint}/create"
-    request_data = {"embedding_name": embedding_name}
-    async with httpx.AsyncClient() as client:
-        response: httpx.Response  = await client.post(create_embedding_url, files=chunks_data, data=request_data)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
+        response: httpx.Response  = await client.post(create_embedding_url, files=chunks_data)
 
         if response.status_code == 200:
             return response.json()
         else:
             raise HTTPException(status_code=response.status_code, detail=response.content)
 
+@app.post("/index/create")
+async def create_index(index_name:Annotated[str,Form()]):
+    create_index_url = f"{config.index_endpoint}/create"
 
-@app.post("/embeddings/create")
-async def create_embedding(comma_separated_list_filenames:Annotated[str,Form()], embedding_name:Annotated[str,Form()]):
-    filenames: list[str] = comma_separated_list_filenames.split(";")
+    request_data = {"index_name":index_name} 
+    async with httpx.AsyncClient() as client:
+        response: httpx.Response  = await client.post(create_index_url, data=request_data)
 
-    new_embedding_folder = config.embeddings_folder / embedding_name
-    new_embedding_folder.mkdir(parents=True,exist_ok=True)
+        if response.status_code == 200:
+            return JSONResponse(response.json())
+        else:
+            return JSONResponse({"origin":"index/create", "status_code":500, "detail":"Error while creating index"})
 
-    logger.info("Processing documents")
-    processed_documents = await _process_documents(filenames)
-    eci = _to_embedding_chunk_index(processed_documents)
-    
-    logger.info(f"Creating chunk index {embedding_name}.index.json")
-    embedding_index_path = new_embedding_folder / f"{embedding_name}.index.json"
-    with open(embedding_index_path,"w") as f:
-        f.write(eci.model_dump_json())
-    
-    logger.info(f"Storing chunks")
-    chunks_folder = new_embedding_folder / "chunks"
-    _create_chunks(processed_documents,chunks_folder)
+@app.post("/index/remove")
+async def remove_index(index_name:Annotated[str,Form()]):
+    remove_index_url = f"{config.index_endpoint}/remove"
+
+    request_data = {"index_name":index_name} 
+    async with httpx.AsyncClient() as client:
+        response: httpx.Response  = await client.post(remove_index_url, data=request_data)
+
+        if response.status_code == 200:
+            return JSONResponse(response.json())
+        else:
+            return JSONResponse({"origin":"index/remove", "status_code":500, "detail":"Error while removing index"})
+
+@app.post("/index/add")
+async def add_document(index_name:Annotated[str,Form()], document_name: Annotated[str,Form()]):
+    """
+    Add a previously uploaded document to the index.
+
+    It first creates an embedding for the document content and then send the embedding
+    to the index endpoint.
+    """
+    add_embedding_url = f"{config.index_endpoint}/add"
+
+    document_folder = config.documents_folder / document_name
+    chunks_folder = document_folder / "chunks"
 
     logger.info("Creating embedding")
     chunks_path = list(chunks_folder.iterdir())
-    chunks_data = create_file_data(chunks_path,"chunks_files")
+    chunks_data = create_list_file_data(chunks_path,"chunks_files")
    
     logger.info("Saving embedding vectors")
-    embedding_data: dict[str,str] = await _create_embedding(chunks_data,embedding_name)
-    sstream = io.StringIO(embedding_data["embedding"])
-    embedding_vectors: np.ndarray = np.loadtxt(sstream)
-    np.save(new_embedding_folder / f"{embedding_name}.npy", embedding_vectors)
+    try:
+        embedding_data: dict[str,str] = await _create_embedding(chunks_data)
+    except HTTPException as ex:
+        return JSONResponse({"origin":"_create_embedding", "status_code":ex.status_code, "detail":ex.detail})
 
-    return JSONResponse({"embedding_name": embedding_name})
+    with tempfile.TemporaryDirectory() as temp_dir:
+        sstream = io.StringIO(embedding_data["embedding"])
+        embedding_vectors: np.ndarray = np.loadtxt(sstream)
+        logger.info(embedding_vectors.shape)
+        embedding_temp_filepath = Path(temp_dir) / f"{index_name}-{document_name}.npy"
+        np.save(embedding_temp_filepath, embedding_vectors)
 
+        embedding_file_data = [create_file_data(embedding_temp_filepath,"embedding_file")]
+        request_data = {"index_name":index_name, "document_name": document_name} 
+        async with httpx.AsyncClient() as client:
+            response: httpx.Response  = await client.post(add_embedding_url, files=embedding_file_data, data=request_data)
 
-
-@app.get("/embeddings/list")
-async def list_embeddings():
-    list_embeddings_url = f"{config.embedding_endpoint}/list"
-    async with httpx.AsyncClient() as client:
-        response = await client.get(list_embeddings_url)
-        
-        if response.status_code == 200:
-            return JSONResponse(response.json())
-        else:
-            raise HTTPException(status_code=response.status_code, detail=response.content)
-
-@app.post("/embeddings/remove")
-async def remove_embedding(embedding_name: Annotated[str, Form()]):
-    # TODO: Currently I am storing the embedding both on the embedding server and in bentinho.
-    # do not store in the embedding server.
-    remove_embeddings_url = f"{config.embedding_endpoint}/remove"
-    request_data = {"embedding_name": embedding_name}
-    async with httpx.AsyncClient() as client:
-        response = await client.post(remove_embeddings_url,data=request_data)
-
-        to_remove_folder = config.embeddings_folder / embedding_name 
-        if to_remove_folder not in config.embeddings_folder.iterdir():
-            raise HTTPException(status_code=500, detail="The embedding does not exist")
-
-        for c in (to_remove_folder / "chunks").iterdir():
-            os.remove(c)
-        (to_remove_folder / "chunks").rmdir()
-        
-        for f in to_remove_folder.iterdir():
-            os.remove(f)
-        to_remove_folder.rmdir()
-        
-        if response.status_code == 200:
-            return JSONResponse(response.json())
-        elif response.status_code == 404:
-            return f"{response.status_code}:{response.content}"
-        else:
-            raise HTTPException(status_code=response.status_code, detail=response.content)
-
-#--------------------------
-# Vector Database 
-#--------------------------
-@app.post("/index/from_embeddings/create")
-async def create_index_from_embeddings(comma_separated_list_embedding_names:Annotated[str,Form()]):
-    create_embedding_url = f"{config.index_endpoint}/from_embeddings/create"
-    embedding_full_path = []
-
-    for name in comma_separated_list_embedding_names.split(";"):
-        embedding_full_path.append( config.embeddings_folder / name / f"{name}.npy" )
-
-    embedding_data = create_file_data(embedding_full_path,"embedding_files")
-    async with httpx.AsyncClient() as client:
-        response: httpx.Response  = await client.post(create_embedding_url, files=embedding_data)
-
-        if response.status_code == 200:
-            return JSONResponse(response.json())
-        else:
-            raise HTTPException(status_code=response.status_code, detail=response.content)
+            if response.status_code == 200:
+                return JSONResponse(response.json())
+            else:
+                raise HTTPException(status_code=response.status_code, detail=response.content)
 
 # TODO: Make LLM request (use llm-assistant)
 # TODO: Output TTS
@@ -510,8 +466,17 @@ async def create_index_from_embeddings(comma_separated_list_embedding_names:Anno
 # TODO: Make possible to add documents to an index without recreating from scratch
 
 #### Query ####
+class DocumentProperties(BaseModel):
+    index: int
+    name: str
+    total_chunks: int
+
+class IndexProperties(BaseModel):
+    index_name: str
+    documents: List[DocumentProperties]
+
 class QueryResponse(BaseModel):
-    embedding_names: List[str]
+    index_properties: IndexProperties
     distances: str
     neighbors: str
 
@@ -519,17 +484,53 @@ def _load_ndarray_from_string(ndarray_string:str) -> np.ndarray:
     sstream = io.StringIO(ndarray_string)
     return np.loadtxt(sstream)
 
-def _get_chunk(chunk_pos:int, embedding_name:str) -> str:
-    chunks_folder = config.embeddings_folder / embedding_name / "chunks"
-    chunk_path = chunks_folder / f"{chunk_pos}.txt"
+def _build_document_vector_searcher(ip: IndexProperties) -> list[int]:
+    """
+    Build an auxiliary data structure to search the document that contains the given chunk.
+
+    The data structure is a vector of chunk indexes representing ranges.
+        v = [a,b,c]
+        v[n] is the last chunk index of the nth document
+
+    If chunk index k is:
+        < a -> chunk belongs to first document
+        < b -> chunk belongs to second document
+    """
+    total_chunks =0
+    v = []
+    for d in ip.documents:
+        v.append( total_chunks + d.total_chunks )
+        total_chunks+=d.total_chunks
+    return v
+
+
+def _get_document_index_from_chunk(chunk_index:int, ip: IndexProperties) -> tuple[int,int]:
+    searcher = _build_document_vector_searcher(ip)
+    document_index = bisect.bisect_left(searcher,chunk_index)
+    if document_index>0:        
+        relative_chunk_index = chunk_index - searcher[document_index-1]
+    else:
+        relative_chunk_index = chunk_index
+    logger.info(chunk_index)
+    logger.info(searcher)
+    logger.info(f"Document Index: {document_index}, Relative Document Index: {relative_chunk_index}")
+    return document_index, relative_chunk_index
+
+
+def _get_chunk(chunk_index:int, ip:IndexProperties) -> str:
+    document_index, relative_chunk_index = _get_document_index_from_chunk(chunk_index,ip)
+    document = ip.documents[document_index]
+
+    chunks_folder = config.documents_folder / document.name / "chunks"
+    chunk_path = chunks_folder / f"{relative_chunk_index}.txt"
     with open(chunk_path) as f:
         return f.read()
 
 
 @app.post("/query")
-async def query(query_string: Annotated[str,Form()]):
+async def query(index_name:Annotated[str,Form()],query_string: Annotated[str,Form()]):
     query_url = f"{config.index_endpoint}/query"
-    data = {"query_string": query_string}
+    data = {"query_string": query_string, "index_name":index_name}
     async with httpx.AsyncClient() as client:
         response: httpx.Response  = await client.post(query_url, data=data)
 
@@ -538,15 +539,14 @@ async def query(query_string: Annotated[str,Form()]):
             distances = _load_ndarray_from_string(query_response.distances)
             neighbors = _load_ndarray_from_string(query_response.neighbors)
 
+            logger.info(query_response)
+
             chunk_index = int(neighbors[0])
-            # TODO: Index built from more than one embedding is not supported yet
-            embedding_name = query_response.embedding_names[0]
-            
             # TODO: Use this chunk to make a llm request
-            chunk = _get_chunk(chunk_index,embedding_name)
+            chunk = _get_chunk(chunk_index,query_response.index_properties)
             return JSONResponse({"chunk":chunk,"distances":[str(d) for d in distances],"neighbors":[str(n) for n in neighbors]})
         else:
-            raise HTTPException(status_code=response.status_code, detail=response.content)
+            return JSONResponse({"origin":"query", "status_code":response.status_code, "detail":response.content})
 
 if __name__ == "__main__":
     default_asr_model = get_model(Language.BrazilianPortuguese,ASRModelVariation.Large)

@@ -59,11 +59,7 @@ def _l2_normalize(vectors):
 # API
 ###########################
 
-class ProcessedDocument(BaseModel):
-    index: int
-    chunks: list[str]
-
-def process_documents(documents: list[str]) -> list[ProcessedDocument]:
+def process_documents(document_content: str) -> list[str]:
     """
     Split documents into a series of chunks.
 
@@ -71,11 +67,7 @@ def process_documents(documents: list[str]) -> list[ProcessedDocument]:
     of chunks of text. Each chunk is supposed to be later embedded 
     into a vector space.
     """
-    processed_documents : list[ProcessedDocument] = []
-    for index, doc in enumerate(documents):
-        processed_documents.append(ProcessedDocument(index=index,chunks=_split_text(doc)))
-    
-    return processed_documents
+    return _split_text(document_content)
 
 def write_embedding(embedding: np.ndarray, output_path:Union[Path,FileIO,TextIO], mode:Literal["text","binary"]="binary"):
     """

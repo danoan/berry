@@ -39,56 +39,37 @@ function remove_document() {
 }
 
 #######################
-# Embeddings
-#######################
-
-function create_embedding() {
-    local EMBEDDING_NAME="${1}"
-    shift
-    local FILENAMES="${1}"
-    shift
-
-    for arg in "$@"; do
-        FILENAMES+=";${arg}"
-    done
-
-    curl -X POST \
-        -F "comma_separated_list_filenames=\"${FILENAMES}\"" \
-        -F "embedding_name=\"${EMBEDDING_NAME}\"" \
-        ${SERVER_ENDPOINT}/embeddings/create
-}
-
-function list_embeddings() {
-    curl -X GET ${SERVER_ENDPOINT}/embeddings/list
-}
-
-function remove_embedding() {
-    local EMBEDDING_NAME="${1}"
-    curl -X POST \
-        -F "embedding_name=\"${EMBEDDING_NAME}\"" \
-        ${SERVER_ENDPOINT}/embeddings/remove
-}
-
-#######################
 # Vector database
 #######################
 
 function create_index() {
-    local EMBEDDING_NAMES="${1}"
-    shift
-
-    for arg in "$@"; do
-        EMBEDDING_NAMES+=";${arg}"
-    done
-
+    local INDEX_NAME="${1}"
     curl -X POST \
-        -F "comma_separated_list_embedding_names=\"${EMBEDDING_NAMES}\"" \
-        ${SERVER_ENDPOINT}/index/from_embeddings/create
+        -F "index_name=\"${INDEX_NAME}\"" \
+        ${SERVER_ENDPOINT}/index/create
+}
+
+function remove_index() {
+    local INDEX_NAME="${1}"
+    curl -X POST \
+        -F "index_name=\"${INDEX_NAME}\"" \
+        ${SERVER_ENDPOINT}/index/remove
+}
+
+function add_document() {
+    local INDEX_NAME="${1}"
+    local DOCUMENT_NAME="${2}"
+    curl -X POST \
+        -F "index_name=\"${INDEX_NAME}\"" \
+        -F "document_name=\"${DOCUMENT_NAME}\"" \
+        ${SERVER_ENDPOINT}/index/add
 }
 
 function query() {
-    local QUERY_STRING="${1}"
+    local INDEX_NAME="${1}"
+    local QUERY_STRING="${2}"
     curl -X POST \
+        -F "index_name=\"${INDEX_NAME}\"" \
         -F "query_string=\"${QUERY_STRING}\"" \
         ${SERVER_ENDPOINT}/query
 }
@@ -120,24 +101,14 @@ function test_remove_document() {
     remove_document "${FILENAME_TO_REMOVE}"
 }
 
-##### Embeddings #####
-
-function test_create_embedding() {
-    create_embedding "my embedding" "hosts.txt" "piancastagnaio_culture.txt"
-}
-
-function test_list_embeddings() {
-    list_embeddings
-}
-
-function test_remove_embedding() {
-    remove_embedding "my embedding"
-}
-
 ##### Vector database #####
 
 function test_create_index() {
     create_index "my embedding"
+}
+
+function test_add_document() {
+    query "my embedding" "hosts"
 }
 
 function test_query() {
@@ -148,35 +119,39 @@ function test_query() {
 
 function test_workflow() {
     # test_select_model
+
+    create_index "berry-piancastagnaio"
+    echo ""
     upload_document "${PROJECT_FOLDER}/embeddings/documents/hosts.txt"
     echo ""
     upload_document "${PROJECT_FOLDER}/embeddings/documents/piancastagnaio_culture.txt"
     echo ""
     upload_document "${PROJECT_FOLDER}/embeddings/documents/piancastagnaio_history.txt"
     echo ""
-    list_documents
+    upload_document "${PROJECT_FOLDER}/embeddings/documents/piancastagnaio_monuments.txt"
+    echo ""
+    add_document "berry-piancastagnaio" "hosts"
+    echo ""
+    add_document "berry-piancastagnaio" "piancastagnaio_culture"
     echo ""
 
-    remove_document "piancastagnaio_history.txt"
-    echo ""
-    list_documents
+    query "berry-piancastagnaio" "daniel taste"
     echo ""
 
-    create_embedding "my embedding" "hosts.txt" "piancastagnaio_culture.txt"
+    # remove_index "berry-piancastagnaio"
+    # echo ""
+}
+
+function test_big_document() {
+    create_index "berry-jekyll"
     echo ""
-    create_embedding "my embedding backup" "hosts.txt" "piancastagnaio_culture.txt"
+    add_document "berry-piancastagnaio" "jekyll_mr_hyde"
     echo ""
-    list_embeddings
-    echo ""
-    remove_embedding "my embedding backup"
-    echo ""
-    list_embeddings
+    query "berry-piancastagnaio" "scotland yard inspector"
     echo ""
 
-    create_index "my embedding"
-    echo ""
-    query "piancastagnaio culture"
-    echo ""
+    # remove_index "berry-piancastagnaio"
+    # echo ""
 }
 
 test_workflow
