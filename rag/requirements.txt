@@ -1,9 +1,0 @@
-# server
-fastapi[standard]
-uvicorn
-python-multipart
-httpx
-pydantic
-
-# index
-faiss

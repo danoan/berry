@@ -1,0 +1,19 @@
+name: Multiple Environment Test Suite
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  test-suite:
+    strategy:
+      matrix:
+        python:
+          - version: 3.12
+            toxenv: 3.12
+          - version: 3.12
+            toxenv: 3.12
+    uses: ./.github/workflows/single-test-suite.yml
+    with:
+      python_version: ${{ matrix.python.version }}
+      toxenv: ${{ matrix.python.toxenv }}
