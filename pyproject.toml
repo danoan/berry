@@ -30,7 +30,7 @@ dependencies = [
     "transformers",
     "torch",
     "vosk==0.3.45",
-    "sounddevice==0.5.2",
+    "sounddevice==0.5.3",
 ]
 
 [project.urls]
